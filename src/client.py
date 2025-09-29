@@ -336,12 +336,6 @@ class Client:
 
         return True
 
-    def connect(self):
-        """
-        Legacy method - use initialize() instead for SSE transport.
-        """
-        return self.initialize()
-
     def disconnect(self):
         """
         Disconnect from the MCP server and clean up resources.
