@@ -3,8 +3,16 @@ import uuid
 import requests
 import threading
 import time
+import sys
+import locale
 from typing import Dict, Any, Optional
 from urllib.parse import urljoin
+
+# 设置输出编码为UTF-8
+if sys.stdout.encoding != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8")
 
 
 class Client:
@@ -87,6 +95,46 @@ class Client:
             print(f"[{self.client_name}]: Unexpected error during initialization: {e}")
             return False
 
+    def list_tools(self) -> bool:
+        """
+        Send tools request to the server.
+
+        Returns:
+            bool: True if request sent and response received successfully
+        """
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
+
+        # Create initialize request according to MCP specification
+        tool_list_request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/list",
+            "params": {
+                "cursor": "0",
+            },
+        }
+
+        try:
+            # Store the request ID for SSE listener to handle
+            self._current_initialize_id = request_id
+
+            # Send request to the endpoint provided by server
+            response = requests.post(
+                self.sse_endpoint,
+                json=tool_list_request,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            # print("Initialize request sent successfully")
+            return True
+
+        except requests.exceptions.RequestException as e:
+            print(f"[{self.client_name}]: Failed to send initialize request: {e}")
+            return False
+
     def _establish_sse_connection(self) -> bool:
         """
         Establish SSE connection to the server.
@@ -138,26 +186,45 @@ class Client:
 
             self.connection_established = True
 
+            # SSE事件状态
+            current_event_type = None
+            current_data_lines = []
+
             for line in response.iter_lines(decode_unicode=True):
                 # Skip empty lines
                 if not line:
+                    # 空行表示一个SSE事件结束，处理累积的数据
+                    if current_event_type and current_data_lines:
+                        data = "".join(
+                            line.replace("\n\n", "") for line in current_data_lines
+                        )
+                        if current_event_type == "endpoint":
+                            self._handle_endpoint_event(data)
+                        elif current_event_type == "message":
+                            # print(f"[{self.client_name}]: Received data: {data}")
+                            self._handle_message_event(data)
+
+                    # 重置状态
+                    current_event_type = None
+                    current_data_lines = []
                     continue
 
-                print(f"[{self.client_name}]: Received line: {line}")
-
                 if line.startswith("event: "):
-                    event_type = line[7:]  # Remove "event: " prefix
+                    current_event_type = line[7:]  # Remove "event: " prefix
                 elif line.startswith("data: "):
-                    data = line[6:]  # Remove "data: " prefix
-
-                    if event_type == "endpoint":
-                        self._handle_endpoint_event(data)
-                    elif event_type == "message":
-                        self._handle_message_event(data)
+                    data_line = line[6:]  # Remove "data: " prefix
+                    current_data_lines.append(data_line)
 
         except Exception as e:
             print(f"[{self.client_name}]: SSE listener error: {e}")
             self.connection_established = False
+            # 清理连接
+            if self.sse_connection:
+                try:
+                    self.sse_connection.close()
+                except:
+                    pass
+                self.sse_connection = None
 
     def _handle_endpoint_event(self, data: str):
         """
@@ -179,25 +246,15 @@ class Client:
         """
         # Server sent a message response
         try:
+            # 尝试解析JSON
             message = json.loads(data)
             request_id = message.get("id")
 
             # Check if this is an initialize response
-            if (
-                request_id
-                and hasattr(self, "_current_initialize_id")
-                and request_id == self._current_initialize_id
-            ):
-                # Handle initialize response
-                if self.handle_initialize_response(message):
-                    # Send initialized notification
-                    self._send_initialized_notification()
-                    self.initialized = True
-                    print(
-                        f"[{self.client_name}]: MCP client initialized successfully via SSE"
-                    )
-                else:
-                    print(f"[{self.client_name}]: Failed to handle initialize response")
+            if self._is_initialize_response(message):
+                self.handle_initialize(message)
+            else:
+                self.handle_normal_message(message)
 
             # Store in message queue for other requests
             if request_id in self.message_queue:
@@ -205,6 +262,41 @@ class Client:
 
         except json.JSONDecodeError as e:
             print(f"[{self.client_name}]: Failed to parse SSE message: {e}")
+            print(f"[{self.client_name}]: Raw data length: {len(data)}")
+            print(
+                f"[{self.client_name}]: Raw data (first 200 chars): {repr(data[:200])}"
+            )
+            print(
+                f"[{self.client_name}]: Raw data (last 200 chars): {repr(data[-200:])}"
+            )
+
+    def _is_initialize_response(self, message: Dict[str, Any]) -> bool:
+        """
+        Check if the message is an initialize response.
+        """
+        return (
+            message.get("id")
+            and hasattr(self, "_current_initialize_id")
+            and message.get("id") == self._current_initialize_id
+        )
+
+    def handle_initialize(self, message: Dict[str, Any]) -> bool:
+        """
+        Handle the initialize response.
+        """
+        # Handle initialize response
+        if self.handle_initialize_response(message):
+            # Send initialized notification
+            self._send_initialized_notification()
+            self.initialized = True
+            print(f"[{self.client_name}]: MCP client initialized successfully via SSE")
+        else:
+            print(f"[{self.client_name}]: Failed to handle initialize response")
+        return True
+
+    def handle_normal_message(self, message: Dict[str, Any]) -> bool:
+        print(f"[{self.client_name}]: Received normal message: {message}")
+        return True
 
     def _wait_for_endpoint(self) -> bool:
         """
@@ -367,6 +459,7 @@ if __name__ == "__main__":
     if client.initialize():
         # print("MCP client initialized successfully!")
         # Perform MCP operations here
+        client.list_tools()
         client.disconnect()
     else:
         print(f"Failed to initialize MCP client")
