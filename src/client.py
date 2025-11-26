@@ -1,12 +1,17 @@
 import json
 import uuid
 import requests
-import threading
 import time
 import sys
 import locale
 from typing import Dict, Any, Optional
 from urllib.parse import urljoin
+
+# 支持相对导入和绝对导入
+try:
+    from .sse_handler import SSEHandler
+except ImportError:
+    from sse_handler import SSEHandler
 
 # 设置输出编码为UTF-8
 if sys.stdout.encoding != "utf-8":
@@ -50,12 +55,12 @@ class Client:
         self.server_capabilities = {}
         self.server_info = {}
 
-        # SSE related attributes
-        self.sse_endpoint = None  # Endpoint for sending messages
-        self.sse_connection = None
-        self.sse_thread = None
+        # SSE handler for managing SSE connections
+        self.sse_handler = SSEHandler(self.host, self.sse_path, self.client_name)
+
+        # Endpoint for sending messages (set by SSE handler callback)
+        self.sse_endpoint = None
         self.message_queue = {}  # Store pending responses by request ID
-        self.connection_established = False
 
     def initialize(self) -> bool:
         """
@@ -65,12 +70,16 @@ class Client:
             bool: True if initialization was successful
         """
         try:
+            # Register SSE event callbacks
+            self.sse_handler.on_endpoint = self._on_sse_endpoint
+            self.sse_handler.on_message = self._on_sse_message
+
             # Step 1: Establish SSE connection
-            if not self._establish_sse_connection():
+            if not self.sse_handler.connect():
                 return False
 
             # Step 2: Wait for endpoint event
-            if not self._wait_for_endpoint():
+            if not self.sse_handler.wait_for_endpoint():
                 return False
 
             # Step 3: Send initialize request (response will be handled by SSE listener)
@@ -133,125 +142,19 @@ class Client:
             print(f"[{self.client_name}]: Failed to send tools/list request: {e}")
             return False
 
-    def _establish_sse_connection(self) -> bool:
+    def _on_sse_endpoint(self, endpoint_url: str):
         """
-        Establish SSE connection to the server.
-
-        Returns:
-            bool: True if connection established successfully
-        """
-        try:
-            # Start SSE connection in a separate thread
-            self.sse_thread = threading.Thread(target=self._sse_listener, daemon=True)
-            self.sse_thread.start()
-
-            # Wait for connection to be established
-            timeout = 10  # 10 seconds timeout
-            start_time = time.time()
-            while (
-                not self.connection_established and (time.time() - start_time) < timeout
-            ):
-                time.sleep(0.1)
-
-            if not self.connection_established:
-                print(
-                    f"[{self.client_name}]: Failed to establish SSE connection within timeout"
-                )
-                return False
-
-            print(f"[{self.client_name}]: SSE connection established")
-            return True
-
-        except Exception as e:
-            print(f"[{self.client_name}]: Failed to establish SSE connection: {e}")
-            return False
-
-    def _sse_listener(self):
-        """
-        Listen for SSE events from the server.
-        """
-        try:
-            response = requests.get(
-                f"{self.host}{self.sse_path}",
-                headers={"Accept": "text/event-stream"},
-                stream=True,
-                timeout=None,
-            )
-            response.raise_for_status()
-
-            # 明确设置编码为UTF-8，避免自动检测导致的编码错误
-            # SSE流应该使用UTF-8编码，特别是包含JSON数据时
-            response.encoding = "utf-8"
-
-            # Store the connection for later cleanup
-            self.sse_connection = response
-
-            self.connection_established = True
-
-            # SSE事件状态
-            current_event_type = None
-            current_data_lines = []
-
-            for line in response.iter_lines(decode_unicode=True):
-                # Skip empty lines
-                if not line:
-                    # 空行表示一个SSE事件结束，处理累积的数据
-                    if current_event_type and current_data_lines:
-                        # 根据SSE规范，多个data行应该用换行符连接
-                        # iter_lines已经去除了行尾的换行符，所以我们需要手动添加
-                        # 如果只有一个data行，直接使用；多个data行用换行符连接
-                        if len(current_data_lines) == 1:
-                            data = current_data_lines[0]
-                        else:
-                            data = "\n".join(current_data_lines)
-
-                        if current_event_type == "endpoint":
-                            self._handle_endpoint_event(data)
-                        elif current_event_type == "message":
-                            # print(f"[{self.client_name}]: Received data: {data}")
-                            self._handle_message_event(data)
-                        elif current_event_type == "ping":
-                            # 忽略ping事件，这是keep-alive消息
-                            pass
-
-                    # 重置状态
-                    current_event_type = None
-                    current_data_lines = []
-                    continue
-
-                if line.startswith("event: "):
-                    current_event_type = line[
-                        7:
-                    ].strip()  # Remove "event: " prefix and strip whitespace
-                elif line.startswith("data: "):
-                    data_line = line[6:]  # Remove "data: " prefix
-                    current_data_lines.append(data_line)
-
-        except Exception as e:
-            print(f"[{self.client_name}]: SSE listener error: {e}")
-            self.connection_established = False
-            # 清理连接
-            if self.sse_connection:
-                try:
-                    self.sse_connection.close()
-                except:
-                    pass
-                self.sse_connection = None
-
-    def _handle_endpoint_event(self, data: str):
-        """
-        Handle endpoint event from SSE stream.
+        Callback for SSE endpoint event.
 
         Args:
-            data: The endpoint data from the SSE event
+            endpoint_url: The endpoint URL from the server
         """
-        # Server sent the endpoint for sending messages
-        self.sse_endpoint = data.strip()
-        print(f"[{self.client_name}]: Received endpoint: {self.sse_endpoint}")
+        self.sse_endpoint = endpoint_url
+        print(f"[{self.client_name}]: Received endpoint: {endpoint_url}")
 
-    def _handle_message_event(self, data: str):
+    def _on_sse_message(self, data: str):
         """
-        Handle message event from SSE stream.
+        Callback for SSE message event.
 
         Args:
             data: The message data from the SSE event
@@ -308,25 +211,6 @@ class Client:
 
     def handle_normal_message(self, message: Dict[str, Any]) -> bool:
         print(f"[{self.client_name}]: Received normal message: {message}")
-        return True
-
-    def _wait_for_endpoint(self) -> bool:
-        """
-        Wait for the server to send the endpoint event.
-
-        Returns:
-            bool: True if endpoint received successfully
-        """
-        timeout = 10  # 10 seconds timeout
-        start_time = time.time()
-
-        while self.sse_endpoint is None and (time.time() - start_time) < timeout:
-            time.sleep(0.1)
-
-        if self.sse_endpoint is None:
-            print(f"[{self.client_name}]: Timeout waiting for endpoint from server")
-            return False
-
         return True
 
     def _send_initialize_request(self) -> bool:
@@ -445,12 +329,8 @@ class Client:
         Disconnect from the MCP server and clean up resources.
         """
         try:
-            if self.sse_connection:
-                self.sse_connection.close()
-            if self.sse_thread and self.sse_thread.is_alive():
-                # Note: SSE thread will stop when connection is closed
-                pass
-            self.connection_established = False
+            if self.sse_handler:
+                self.sse_handler.disconnect()
             self.initialized = False
             print(f"[{self.client_name}]: Disconnected from MCP server")
         except Exception as e:
