@@ -105,7 +105,7 @@ class Client:
         # Generate unique request ID
         request_id = str(uuid.uuid4())
 
-        # Create initialize request according to MCP specification
+        # Create tools/list request according to MCP specification
         tool_list_request = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -116,10 +116,8 @@ class Client:
         }
 
         try:
-            # Store the request ID for SSE listener to handle
-            self._current_initialize_id = request_id
-
             # Send request to the endpoint provided by server
+            # Note: tools/list response will be handled by _handle_message_event
             response = requests.post(
                 self.sse_endpoint,
                 json=tool_list_request,
@@ -128,11 +126,11 @@ class Client:
             )
             response.raise_for_status()
 
-            # print("Initialize request sent successfully")
+            # print("Tools list request sent successfully")
             return True
 
         except requests.exceptions.RequestException as e:
-            print(f"[{self.client_name}]: Failed to send initialize request: {e}")
+            print(f"[{self.client_name}]: Failed to send tools/list request: {e}")
             return False
 
     def _establish_sse_connection(self) -> bool:
@@ -181,6 +179,10 @@ class Client:
             )
             response.raise_for_status()
 
+            # 明确设置编码为UTF-8，避免自动检测导致的编码错误
+            # SSE流应该使用UTF-8编码，特别是包含JSON数据时
+            response.encoding = "utf-8"
+
             # Store the connection for later cleanup
             self.sse_connection = response
 
@@ -195,14 +197,22 @@ class Client:
                 if not line:
                     # 空行表示一个SSE事件结束，处理累积的数据
                     if current_event_type and current_data_lines:
-                        data = "".join(
-                            line.replace("\n\n", "") for line in current_data_lines
-                        )
+                        # 根据SSE规范，多个data行应该用换行符连接
+                        # iter_lines已经去除了行尾的换行符，所以我们需要手动添加
+                        # 如果只有一个data行，直接使用；多个data行用换行符连接
+                        if len(current_data_lines) == 1:
+                            data = current_data_lines[0]
+                        else:
+                            data = "\n".join(current_data_lines)
+
                         if current_event_type == "endpoint":
                             self._handle_endpoint_event(data)
                         elif current_event_type == "message":
                             # print(f"[{self.client_name}]: Received data: {data}")
                             self._handle_message_event(data)
+                        elif current_event_type == "ping":
+                            # 忽略ping事件，这是keep-alive消息
+                            pass
 
                     # 重置状态
                     current_event_type = None
@@ -210,7 +220,9 @@ class Client:
                     continue
 
                 if line.startswith("event: "):
-                    current_event_type = line[7:]  # Remove "event: " prefix
+                    current_event_type = line[
+                        7:
+                    ].strip()  # Remove "event: " prefix and strip whitespace
                 elif line.startswith("data: "):
                     data_line = line[6:]  # Remove "data: " prefix
                     current_data_lines.append(data_line)
